@@ -18,6 +18,72 @@ namespace FLASH_NAMESPACE {
 
 using namespace cute;
 
+
+__device__ __constant__ uint32_t exp2_slopes_f[8] = {
+    0x3eb95c1e,
+    0x3eca22e7,
+    0x3edc6e66,
+    0x3ef061c9,
+    0x3f0311b7,
+    0x3f0eee96,
+    0x3f1bde51,
+    0x3f29f9c9
+};
+
+__device__ __constant__ uint32_t exp2_intercepts_f[8] = {
+    0x3f5cae0f,
+    0x3f640507,
+    0x3f6ae156,
+    0x3f711d65,
+    0x3f768dcf,
+    0x3f7b00a2,
+    0x3f7e3c91,
+    0x3f800000
+};
+
+__device__ __forceinline__ bool is_normal_float(float x) {
+    uint32_t bits = *reinterpret_cast<uint32_t*>(&x);
+    uint32_t exponent = (bits >> 23) & 0xFF;
+    return (exponent > 0) && (exponent < 255);
+}
+
+template <bool Use_half_slopes=true>
+__device__ __forceinline__ float exp2f_pwl(float x) {
+    // Fast path for x > 0 (rare for ASA, but safe to support)
+    if (!is_normal_float(x) || x > 0.0f) {
+        return exp2f(x);
+    }
+
+    // Decompose x = xi + xf, with xf in (-1, 0]
+    // Using xi = floor(x) + 1 so that xf = x - xi ∈ (-1, 0]
+    float xi_f = floorf(x) + 1.0f;
+    float xf   = x - xi_f;
+
+    // Segment lookup for xf in (-1, 0]
+    // t in (0,1]; k = min(int(t * 8), 7)
+    const float t = xf + 1.0f; // (0, 1]
+    int k = (int)floorf(t * 8.0f);
+    if (k >= 8) k = 7;
+    if (k < 0)  k = 0;
+
+    // Precomputed PWL coefficients (float32)
+    // slope[k] * xf + intercept[k] ≈ 2^xf, in (0.5, 1]
+
+    float intercept = *reinterpret_cast<float*>(&exp2_intercepts_f[k]);
+    float slope = Use_half_slopes
+        ? __half2float(__float2half(*reinterpret_cast<float*>(&exp2_slopes_f[k])))
+        : *reinterpret_cast<float*>(&exp2_slopes_f[k]);
+    float mant = slope * xf + intercept;
+
+    // y = 2^xi * mant  (use ldexpf for exact exponent scaling)
+    int xi = (int)xi_f; // xi_f is integer-valued already
+    float y = ldexpf(mant, xi);
+    return y;
+}
+
+
+
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<bool zero_init=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1, typename Operator>
@@ -83,9 +149,9 @@ __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tenso
             // See: https://github.com/pytorch/pytorch/issues/121558 for more details
             // This macro is set in PyTorch and not FlashAttention
             #ifdef UNFUSE_FMA
-                tensor(mi, ni) = exp2f(__fmul_rn(tensor(mi, ni), scale) - max_scaled);
+                tensor(mi, ni) = exp2f_pwl(__fmul_rn(tensor(mi, ni), scale) - max_scaled);
             #else
-                tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
+                tensor(mi, ni) = exp2f_pwl(tensor(mi, ni) * scale - max_scaled);
             #endif
         }
     }
@@ -115,7 +181,7 @@ __forceinline__ __device__ void max_scale_exp2_sum(Tensor<Engine0, Layout0> &ten
             // Instead of computing exp(x - max), we compute exp2(x * log_2(e) -
             // max * log_2(e)) This allows the compiler to use the ffma
             // instruction instead of fadd and fmul separately.
-            tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
+            tensor(mi, ni) = exp2f_pwl<false>(tensor(mi, ni) * scale - max_scaled);
             sum(mi) += tensor(mi, ni);
         }
         SumOp<float> sum_op;
@@ -154,7 +220,7 @@ struct Softmax {
                 float scores_max_cur = !Check_inf
                     ? row_max(mi)
                     : (row_max(mi) == -INFINITY ? 0.0f : row_max(mi));
-                float scores_scale = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
+                float scores_scale = exp2f_pwl<false>((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
                 row_sum(mi) *= scores_scale;
                 #pragma unroll
                 for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scores_scale; }
